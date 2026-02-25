@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama2-transformer-lens-gsm8k"
+version = "0.1.0"
+description = "Experiment project for analyzing Llama2-7B with TransformerLens on GSM8K"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "transformer-lens>=2.6.0",
+  "torch>=2.2.0",
+  "datasets>=2.20.0",
+  "transformers>=4.43.0",
+  "accelerate>=0.33.0",
+  "pandas>=2.2.0",
+  "tqdm>=4.66.0",
+]
+
+[project.scripts]
+run-analysis = "gsm8k_llama2_analysis.run_analysis:main"
+
+[project.optional-dependencies]
+dev = [
+  "ruff>=0.6.0",
+  "pytest>=8.2.0",
+]
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gsm8k_llama2_analysis"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
