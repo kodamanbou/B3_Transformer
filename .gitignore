@@ -8,3 +8,7 @@ data/
 outputs/
 *.log
 .env
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
