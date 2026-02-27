@@ -18,5 +18,3 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 
 RUN uv sync
-
-CMD ["uv", "run", "python", "-m", "gsm8k_llama2_analysis.run_analysis", "--max-samples", "4"]

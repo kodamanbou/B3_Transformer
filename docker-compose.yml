@@ -11,5 +11,8 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       - ./:/workspace
+    shm_size: "16g"
+    stdin_open: true
+    tty: true
     working_dir: /workspace
     command: /bin/bash
