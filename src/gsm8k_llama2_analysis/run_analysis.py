@@ -24,7 +24,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--split", default="test", choices=["train", "test"])
     parser.add_argument("--max-samples", type=int, default=16)
-    parser.add_argument("--max-new-tokens", type=int, default=1)
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=256,
+        help="Maximum number of new tokens to generate per example.",
+    )
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument(
@@ -227,8 +232,12 @@ def analyze_examples(
         last_token_logits = logits[0, -1]
         pred_token_id = int(torch.argmax(last_token_logits).item())
         pred_token = model.tokenizer.decode([pred_token_id])
-        generation = model.to_string(generated_tokens[0])
-        predicted_answer = extract_final_answer(generation)
+        prompt_token_count = tokens.shape[-1]
+        generated_completion = model.to_string(generated_tokens[0, prompt_token_count:])
+        generated_full_text = model.to_string(generated_tokens[0])
+        predicted_answer = extract_final_answer(generated_completion)
+        if predicted_answer is None:
+            predicted_answer = extract_final_answer(generated_full_text)
         reference_final_answer = extract_final_answer(ex["answer"])
         is_correct = answers_match(predicted_answer, reference_final_answer)
 
@@ -238,7 +247,8 @@ def analyze_examples(
                 "question": ex["question"],
                 "reference_answer": ex["answer"],
                 "predicted_next_token": pred_token,
-                "generated_text": generation,
+                "generated_text": generated_completion,
+                "generated_text_full": generated_full_text,
                 "predicted_answer": predicted_answer,
                 "reference_final_answer": reference_final_answer,
                 "is_correct": is_correct,
