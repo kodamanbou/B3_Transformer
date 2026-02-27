@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -27,17 +28,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", default=DEFAULT_MODEL_NAME)
     parser.add_argument("--output-dir", default="outputs")
     parser.add_argument(
+        "--evaluation-mode",
+        default="single",
+        choices=["single", "all"],
+        help="Whether to evaluate only --mode or all prompting modes.",
+    )
+    parser.add_argument(
         "--mode",
         default="direct",
         choices=["direct", "cot", "icl", "icl_cot"],
         help="Prompting mode: direct answer, chain-of-thought prompt, ICL examples, or ICL with CoT examples.",
     )
     parser.add_argument(
-        "--icl-k",
+        "--num-shots",
         type=int,
         default=8,
         help="Number of demonstrations used in ICL modes.",
     )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducible demo selection.")
     return parser.parse_args()
 
 
@@ -51,6 +59,17 @@ def load_gsm8k_examples(split: str, max_samples: int, start_index: int = 0) -> l
     for row in ds.select(range(start_index, end_index)):
         examples.append({"question": row["question"], "answer": row["answer"]})
     return examples
+
+
+def load_demo_candidate_pool(split: str, excluded_indices: set[int] | None = None) -> list[dict[str, str]]:
+    ds = load_dataset("gsm8k", "main", split=split)
+    excluded = excluded_indices or set()
+    candidates: list[dict[str, str]] = []
+    for idx, row in enumerate(ds):
+        if idx in excluded:
+            continue
+        candidates.append({"question": row["question"], "answer": row["answer"]})
+    return candidates
 
 
 def extract_final_answer(text: str) -> str | None:
@@ -94,14 +113,31 @@ def extract_reasoning(answer: str) -> str:
     return "\n".join(lines[:-1]).strip()
 
 
-def load_icl_demonstrations(mode: str, icl_k: int) -> list[dict[str, str]] | None:
+def load_icl_demonstrations(
+    mode: str,
+    num_shots: int,
+    seed: int,
+    eval_split: str,
+    eval_start_index: int,
+    max_samples: int,
+) -> list[dict[str, str]] | None:
     if mode not in {"icl", "icl_cot"}:
         return None
 
-    ds = load_dataset("gsm8k", "main", split="train")
-    k = min(icl_k, len(ds))
+    excluded_indices: set[int] = set()
+    if eval_split == "train":
+        eval_end_index = eval_start_index + max_samples
+        excluded_indices = set(range(eval_start_index, eval_end_index))
+
+    pool = load_demo_candidate_pool(split="train", excluded_indices=excluded_indices)
+    rng = random.Random(seed)
+    rng.shuffle(pool)
+
     demonstrations: list[dict[str, str]] = []
-    for row in ds.select(range(k)):
+    for row in pool:
+        if len(demonstrations) >= num_shots:
+            break
+
         final_answer = extract_final_answer(row["answer"])
         if final_answer is None:
             continue
@@ -115,6 +151,11 @@ def load_icl_demonstrations(mode: str, icl_k: int) -> list[dict[str, str]] | Non
                 demo_answer = f"Step 1: Compute the required arithmetic.\nFinal answer: {final_answer}"
 
         demonstrations.append({"question": row["question"], "answer": demo_answer})
+
+    if len(demonstrations) < num_shots:
+        raise ValueError(
+            f"Unable to build enough demonstrations for mode={mode}. requested={num_shots}, got={len(demonstrations)}"
+        )
     return demonstrations
 
 
@@ -162,6 +203,8 @@ def analyze_examples(
     max_new_tokens: int,
     mode: str,
     demonstrations: list[dict[str, str]] | None,
+    num_shots: int,
+    seed: int,
 ) -> list[dict[str, Any]]:
     model.eval()
     results: list[dict[str, Any]] = []
@@ -199,6 +242,9 @@ def analyze_examples(
                 "predicted_answer": predicted_answer,
                 "reference_final_answer": reference_final_answer,
                 "is_correct": is_correct,
+                "mode": mode,
+                "num_shots": num_shots,
+                "seed": seed,
                 "last_layer_resid_l2_norm": float(torch.norm(resid, p=2).item()),
                 "last_layer_resid_mean": float(torch.mean(resid).item()),
                 "last_layer_resid_std": float(torch.std(resid).item()),
@@ -212,33 +258,51 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    demonstrations = load_icl_demonstrations(args.mode, args.icl_k)
-    eval_start_index = args.icl_k if args.split == "train" and demonstrations else 0
+    modes = [args.mode] if args.evaluation_mode == "single" else ["direct", "cot", "icl", "icl_cot"]
+    eval_start_index = args.num_shots if args.split == "train" and any(m in {"icl", "icl_cot"} for m in modes) else 0
     examples = load_gsm8k_examples(args.split, args.max_samples, start_index=eval_start_index)
 
     model = HookedTransformer.from_pretrained(args.model_name, device="cuda" if torch.cuda.is_available() else "cpu")
-    results = analyze_examples(
-        model,
-        examples,
-        args.max_new_tokens,
-        mode=args.mode,
-        demonstrations=demonstrations,
-    )
+    results: list[dict[str, Any]] = []
+    summary_metrics: list[dict[str, Any]] = []
+    for mode in modes:
+        demonstrations = load_icl_demonstrations(
+            mode=mode,
+            num_shots=args.num_shots,
+            seed=args.seed,
+            eval_split=args.split,
+            eval_start_index=eval_start_index,
+            max_samples=args.max_samples,
+        )
+        mode_results = analyze_examples(
+            model,
+            examples,
+            args.max_new_tokens,
+            mode=mode,
+            demonstrations=demonstrations,
+            num_shots=args.num_shots,
+            seed=args.seed,
+        )
+        results.extend(mode_results)
+
+        total_samples = len(mode_results)
+        num_correct = sum(1 for row in mode_results if row.get("is_correct") is True)
+        accuracy = (num_correct / total_samples) if total_samples > 0 else 0.0
+        summary_metrics.append(
+            {
+                "mode": mode,
+                "num_shots": args.num_shots,
+                "seed": args.seed,
+                "split": args.split,
+                "total_samples": total_samples,
+                "num_correct": num_correct,
+                "accuracy": accuracy,
+            }
+        )
 
     json_path = output_dir / "analysis_results.json"
     csv_path = output_dir / "analysis_results.csv"
     summary_path = output_dir / "summary_metrics.json"
-
-    total_samples = len(results)
-    num_correct = sum(1 for row in results if row.get("is_correct") is True)
-    accuracy = (num_correct / total_samples) if total_samples > 0 else 0.0
-    summary_metrics = {
-        "mode": args.mode,
-        "split": args.split,
-        "total_samples": total_samples,
-        "num_correct": num_correct,
-        "accuracy": accuracy,
-    }
 
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
