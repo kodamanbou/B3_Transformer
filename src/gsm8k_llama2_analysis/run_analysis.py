@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -51,10 +53,38 @@ def load_gsm8k_examples(split: str, max_samples: int, start_index: int = 0) -> l
     return examples
 
 
-def extract_final_answer(answer: str) -> str:
-    if "####" in answer:
-        return answer.split("####", maxsplit=1)[1].strip()
-    return answer.strip().splitlines()[-1].strip()
+def extract_final_answer(text: str) -> str | None:
+    if not text:
+        return None
+
+    candidate_text = text
+    if "####" in text:
+        candidate_text = text.split("####", maxsplit=1)[1].strip()
+
+    final_answer_line_pattern = re.compile(r"final\s*answer\s*:\s*(.+)", flags=re.IGNORECASE)
+    for line in reversed(candidate_text.splitlines()):
+        match = final_answer_line_pattern.search(line.strip())
+        if match:
+            candidate_text = match.group(1).strip()
+            break
+
+    number_pattern = re.compile(r"[-+]?\d[\d,]*(?:\.\d+)?")
+    matches = number_pattern.findall(candidate_text)
+    if not matches:
+        return None
+    return matches[-1].replace(",", "")
+
+
+def answers_match(predicted: str | None, reference: str | None) -> bool:
+    if predicted is None or reference is None:
+        return False
+
+    try:
+        pred_decimal = Decimal(predicted)
+        ref_decimal = Decimal(reference)
+        return pred_decimal == ref_decimal
+    except InvalidOperation:
+        return predicted.strip() == reference.strip()
 
 
 def extract_reasoning(answer: str) -> str:
@@ -73,6 +103,8 @@ def load_icl_demonstrations(mode: str, icl_k: int) -> list[dict[str, str]] | Non
     demonstrations: list[dict[str, str]] = []
     for row in ds.select(range(k)):
         final_answer = extract_final_answer(row["answer"])
+        if final_answer is None:
+            continue
         if mode == "icl":
             demo_answer = f"Final answer: {final_answer}"
         else:
@@ -153,6 +185,9 @@ def analyze_examples(
         pred_token_id = int(torch.argmax(last_token_logits).item())
         pred_token = model.tokenizer.decode([pred_token_id])
         generation = model.to_string(generated_tokens[0])
+        predicted_answer = extract_final_answer(generation)
+        reference_final_answer = extract_final_answer(ex["answer"])
+        is_correct = answers_match(predicted_answer, reference_final_answer)
 
         results.append(
             {
@@ -161,6 +196,9 @@ def analyze_examples(
                 "reference_answer": ex["answer"],
                 "predicted_next_token": pred_token,
                 "generated_text": generation,
+                "predicted_answer": predicted_answer,
+                "reference_final_answer": reference_final_answer,
+                "is_correct": is_correct,
                 "last_layer_resid_l2_norm": float(torch.norm(resid, p=2).item()),
                 "last_layer_resid_mean": float(torch.mean(resid).item()),
                 "last_layer_resid_std": float(torch.std(resid).item()),
@@ -189,13 +227,28 @@ def main() -> None:
 
     json_path = output_dir / "analysis_results.json"
     csv_path = output_dir / "analysis_results.csv"
+    summary_path = output_dir / "summary_metrics.json"
+
+    total_samples = len(results)
+    num_correct = sum(1 for row in results if row.get("is_correct") is True)
+    accuracy = (num_correct / total_samples) if total_samples > 0 else 0.0
+    summary_metrics = {
+        "mode": args.mode,
+        "split": args.split,
+        "total_samples": total_samples,
+        "num_correct": num_correct,
+        "accuracy": accuracy,
+    }
 
     with json_path.open("w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
+    with summary_path.open("w", encoding="utf-8") as f:
+        json.dump(summary_metrics, f, ensure_ascii=False, indent=2)
     pd.DataFrame(results).to_csv(csv_path, index=False)
 
     print(f"Saved JSON: {json_path}")
     print(f"Saved CSV:  {csv_path}")
+    print(f"Saved summary metrics: {summary_path}")
 
 
 if __name__ == "__main__":
